@@ -54,7 +54,7 @@ type writer struct {
 	size    int64
 
 	intEncoder      *encoding.Encoder
-	postingsEncoder *pilosa.Encoder
+	postingsEncoder *pilosaEncoder
 	fstWriter       *fstWriter
 	docsWriter      *DocumentsWriter
 
@@ -111,9 +111,9 @@ func newWriterWithVersion(opts WriterOptions, vers *Version) (Writer, error) {
 	}
 
 	return &writer{
-		postingsEncoder:     pilosa.NewEncoder(),
 		version:              v,
 		intEncoder:           encoding.NewEncoder(defaultInitialIntEncoderSize),
+		postingsEncoder:      newPilosaEncoder(),
 		fstWriter:            newFSTWriter(opts),
 		docsWriter:           docsWriter,
 		fstTermsOffsets:      make([]uint64, 0, defaultInitialFSTTermsOffsetsSize),
@@ -140,8 +140,8 @@ func (w *writer) clear() {
 	w.fstTermsFileWritten = false
 	w.fstTermsOffsets = w.fstTermsOffsets[:0]
 	w.termPostingsOffsets = w.termPostingsOffsets[:0]
-
 	w.fieldPostingsOffsets = w.fieldPostingsOffsets[:0]
+	w.fieldTermsLengths = w.fieldTermsLengths[:0]
 	w.fieldData.Reset()
 	w.fieldBuffer.Reset()
 
@@ -212,20 +212,133 @@ func (w *writer) WriteDocumentsIndex(iow io.Writer) error {
 	return w.docsWriter.WriteDocumentsIndex(iow)
 }
 
+type pilosaEncoder struct {
+	enc *pilosa.Encoder
+}
+
+func newPilosaEncoder() *pilosaEncoder {
+	return &pilosaEncoder{
+		enc: pilosa.NewEncoder(),
+	}
+}
+
+func (e *pilosaEncoder) writePostings(iow io.Writer, pl postings.List) (int, error) {
+	postingBytes, err := e.enc.Encode(pl)
+	if err != nil {
+		return 0, err
+	}
+	return iow.Write(postingBytes)
+}
+
+func (e *pilosaEncoder) Reset() {
+	e.enc.Reset()
+}
+
 func (w *writer) WritePostingsOffsets(iow io.Writer) error {
 	var (
 		writeFieldsPostingList = w.version.supportsFieldPostingsList()
 		currentOffset          = uint64(0)
 	)
-	writePL := func(pl postings.List) (uint64, error) { // helper method
-		// serialize the postings list
-		w.postingsEncoder.Reset()
-		postingsBytes, err := w.postingsEncoder.Encode(pl)
-		if err != nil {
-			return 0, err
+	consume := func() error {
+		closed := make([]int, 0, len(w.writeFSTTermsWorkers))
+		for {
+		WorkerPostingsConsumeLoop:
+			for i, worker := range w.writeFSTTermsWorkers {
+				for _, j := range closed {
+					if i == j {
+						continue WorkerPostingsConsumeLoop
+					}
+				}
+
+				result := <-worker.resultCh
+				if result.abort {
+					closed = append(closed, i)
+					continue
+				}
+
+				if err := result.err; err != nil {
+					return err
+				}
+
+				for _, size := range result.postingsListsSizes {
+					postingsBytes := result.postingsBytes[:size]
+					result.postingsBytes = result.postingsBytes[size:]
+					if len(postingsBytes) == 0 {
+						w.termPostingsOffsets = append(w.termPostingsOffsets, math.MaxUint64)
+					} else {
+						// serialize the postings list
+						n, err := w.writePayloadAndSizeAndMagicNumber(iow, postingsBytes)
+						if err != nil {
+							return err
+						}
+
+						currentOffset += n
+						// track current offset as the offset for the current field/term
+						w.termPostingsOffsets = append(w.termPostingsOffsets, currentOffset)
+					}
+				}
+				w.fieldTermsLengths = append(w.fieldTermsLengths, uint64(len(result.postingsListsSizes)))
+
+				if writeFieldsPostingList {
+					if len(result.fieldPostingsBytes) == 0 {
+						// empty postings list, no-op and write math.MaxUint64 here
+						w.fieldPostingsOffsets = append(w.fieldPostingsOffsets, math.MaxUint64)
+					} else {
+						// serialize the postings list
+						n, err := w.writePayloadAndSizeAndMagicNumber(iow, result.fieldPostingsBytes)
+						if err != nil {
+							return err
+						}
+						// update offset with the number of bytes we've written
+						currentOffset += n
+						// track current offset as the offset for the current field
+						w.fieldPostingsOffsets = append(w.fieldPostingsOffsets, currentOffset)
+					}
+				}
+			}
+			if len(closed) == len(w.writeFSTTermsWorkers) {
+				// All workers have closed their result channels, we're done.
+				return nil
+			}
 		}
-		return w.writePayloadAndSizeAndMagicNumber(iow, postingsBytes)
 	}
+
+	// Run workers.
+	var workersDone sync.WaitGroup
+	for i := range w.writeFSTTermsWorkers {
+		termsIter, err := w.builder.TermsIterator()
+		if err != nil {
+			return err
+		}
+
+		worker := w.writeFSTTermsWorkers[i]
+		worker.reset(termsIter)
+		workersDone.Add(1)
+		go func(i int) {
+			worker.run()
+			workersDone.Done()
+		}(i)
+	}
+
+	// Ensure we cleanup all workers.
+	defer func() {
+		// Abort workers if they haven't already closed due to successful
+		for _, worker := range w.writeFSTTermsWorkers {
+			worker.closePublisher()
+		}
+		// Wait for all workers to finish.
+		workersDone.Wait()
+	}()
+
+	// Start consume worker.
+	consumeCh := make(chan error)
+	go func() {
+		consumeResult := consume()
+		if consumeResult != nil {
+			fmt.Printf("!! compact write postings err: %v\n", consumeResult)
+		}
+		consumeCh <- consumeResult
+	}()
 
 	// retrieve known fields
 	fields, err := w.builder.FieldsPostingsList()
@@ -239,48 +352,37 @@ func (w *writer) WritePostingsOffsets(iow io.Writer) error {
 	}
 
 	// for each known field
+	var (
+		fieldPostingsBuff = bytes.NewBuffer(nil)
+		fieldIndex        = -1
+	)
 	for fields.Next() {
 		f, fieldPostingsList := fields.Current()
-		// retrieve known terms for current field
+		fieldIndex++
+
 		if err := termsIter.ResetField(f); err != nil {
 			return err
 		}
 
-		// for each term corresponding to the current field
-		for termsIter.Next() {
-			_, pl := termsIter.Current()
-			if pl.IsEmpty() {
-				// empty postings list, no-op and write math.MaxUint64 here
-				w.termPostingsOffsets = append(w.termPostingsOffsets, math.MaxUint64)
-			} else {
-				// write the postings list
-				n, err := writePL(pl)
-				if err != nil {
-					return err
-				}
-				// update offset with the number of bytes we've written
-				currentOffset += n
-				// track current offset as the offset for the current field/term
-				w.termPostingsOffsets = append(w.termPostingsOffsets, currentOffset)
+		// encode the field level postings list
+		var fieldPostingsBytes []byte
+		fieldPostingsBuff.Reset()
+		if writeFieldsPostingList && !fieldPostingsList.IsEmpty() {
+			// Write the unioned postings list out.
+			_, err := w.postingsEncoder.writePostings(fieldPostingsBuff, fieldPostingsList)
+			if err != nil {
+				return err
 			}
+			fieldPostingsBytes = append(make([]byte, 0, len(fieldPostingsBuff.Bytes())), fieldPostingsBuff.Bytes()...)
 		}
 
-		// write the field level postings list
-		if writeFieldsPostingList {
-			if fieldPostingsList.IsEmpty() {
-				// empty postings list, no-op and write math.MaxUint64 here
-				w.fieldPostingsOffsets = append(w.fieldPostingsOffsets, math.MaxUint64)
-			} else {
-				// Write the unioned postings list out.
-				n, err := writePL(fieldPostingsList)
-				if err != nil {
-					return err
-				}
-				// update offset with the number of bytes we've written
-				currentOffset += n
-				// track current offset as the offset for the current field
-				w.fieldPostingsOffsets = append(w.fieldPostingsOffsets, currentOffset)
-			}
+		numWorker := fieldIndex % len(w.writeFSTTermsWorkers)
+		worker := w.writeFSTTermsWorkers[numWorker]
+
+		worker.workCh <- writeFSTTermsArgs{
+			argsType:           writeFSTTermsArgsTypePostings,
+			field:              append(make([]byte, 0, len(f)), f...),
+			fieldPostingsBytes: fieldPostingsBytes,
 		}
 
 		if err := termsIter.Err(); err != nil {
@@ -300,14 +402,23 @@ func (w *writer) WritePostingsOffsets(iow io.Writer) error {
 		return err
 	}
 
+	// Signal workers no more to publish.
+	for _, worker := range w.writeFSTTermsWorkers {
+		worker.closePublisher()
+	}
+	if err := <-consumeCh; err != nil {
+		return err
+	}
+
 	w.postingsFileWritten = true
 	return nil
 }
 
 type writeFSTTermsWorker struct {
-	numWorker int
-	fstWriter *fstWriter
-	fstBuff   *bytes.Buffer
+	numWorker     int
+	pilosaEncoder *pilosaEncoder
+	fstWriter     *fstWriter
+	fstBuff       *bytes.Buffer
 
 	termsIter sgmt.ReuseableTermsIterator
 
@@ -321,19 +432,47 @@ type workSignal struct {
 	abort bool
 }
 
+type writeFSTTermsArgsType int
+
+const (
+	writeFSTTermsArgsTypePostings writeFSTTermsArgsType = iota
+	writeFSTTermsArgsTypeTerms
+)
+
 type writeFSTTermsArgs struct {
 	workSignal
-	field        []byte
+	argsType writeFSTTermsArgsType
+
+	// common
+	field []byte
+
+	// for args type postings
+	fieldPostingsBytes []byte
+
+	// for args type terms
 	metadataBuff []byte
 	termsOffsets []uint64
 }
 
 type writeFSTTermsResult struct {
+	// common
 	workSignal
-	err          error
+	err error
+
+	// for args type postings
+	postingsBytes      []byte
+	postingsListsSizes []uint32
+	fieldPostingsBytes []byte
+
+	// for args type terms
 	metadataBuff []byte
 	fstBuff      []byte
 	numBytesFST  uint64
+}
+
+type encodedPostingsList struct {
+	encoded []byte
+	err     error
 }
 
 func newWriteFSTTermsWorker(
@@ -341,9 +480,10 @@ func newWriteFSTTermsWorker(
 	opts WriterOptions,
 ) *writeFSTTermsWorker {
 	w := &writeFSTTermsWorker{
-		numWorker: numWorker,
-		fstWriter: newFSTWriter(opts),
-		fstBuff:   bytes.NewBuffer(nil),
+		numWorker:     numWorker,
+		pilosaEncoder: newPilosaEncoder(),
+		fstWriter:     newFSTWriter(opts),
+		fstBuff:       bytes.NewBuffer(nil),
 	}
 	return w
 }
@@ -352,6 +492,7 @@ func (w *writeFSTTermsWorker) reset(
 	termsIter sgmt.ReuseableTermsIterator,
 ) {
 	numWorker := w.numWorker
+	pilosaEncoder := w.pilosaEncoder
 	fstWriter := w.fstWriter
 	fstBuff := w.fstBuff
 
@@ -361,6 +502,7 @@ func (w *writeFSTTermsWorker) reset(
 	w.termsIter = termsIter
 	w.workCh = make(chan writeFSTTermsArgs, 32)
 	w.resultCh = make(chan writeFSTTermsResult, 32)
+	w.pilosaEncoder = pilosaEncoder
 	w.fstWriter = fstWriter
 	w.fstBuff = fstBuff
 }
@@ -384,7 +526,12 @@ func (w *writeFSTTermsWorker) run() {
 		}
 
 		// Run and publish result.
-		w.resultCh <- w.work(args)
+		switch args.argsType {
+		case writeFSTTermsArgsTypePostings:
+			w.resultCh <- w.writeFSTPostings(args)
+		case writeFSTTermsArgsTypeTerms:
+			w.resultCh <- w.writeFSTTerms(args)
+		}
 	}
 }
 
@@ -395,7 +542,38 @@ func (w *writeFSTTermsWorker) closePublisher() {
 	}
 }
 
-func (w *writeFSTTermsWorker) work(args writeFSTTermsArgs) writeFSTTermsResult {
+func (w *writeFSTTermsWorker) writeFSTPostings(args writeFSTTermsArgs) writeFSTTermsResult {
+	w.pilosaEncoder.Reset()
+
+	result := writeFSTTermsResult{
+		postingsListsSizes: make([]uint32, 0, 64),
+		fieldPostingsBytes: args.fieldPostingsBytes,
+	}
+
+	if err := w.termsIter.ResetField(args.field); err != nil {
+		return writeFSTTermsResult{err: err}
+	}
+
+	w.fstBuff.Reset()
+	for w.termsIter.Next() {
+		_, pl := w.termsIter.Current()
+
+		if pl.IsEmpty() {
+			result.postingsListsSizes = append(result.postingsListsSizes, 0)
+		} else {
+			n, err := w.pilosaEncoder.writePostings(w.fstBuff, pl)
+			if err != nil {
+				return writeFSTTermsResult{err: err}
+			}
+			result.postingsListsSizes = append(result.postingsListsSizes, uint32(n))
+		}
+	}
+
+	result.postingsBytes = append(make([]byte, 0, len(w.fstBuff.Bytes())), w.fstBuff.Bytes()...)
+	return result
+}
+
+func (w *writeFSTTermsWorker) writeFSTTerms(args writeFSTTermsArgs) writeFSTTermsResult {
 	// Reset buffers.
 	w.fstBuff.Reset()
 	w.fstWriter.Reset(w.fstBuff)
@@ -551,7 +729,13 @@ func (w *writer) WriteFSTTerms(iow io.Writer) error {
 
 	// Start consume worker.
 	consumeCh := make(chan error)
-	go func() { consumeCh <- consume() }()
+	go func() {
+		consumeResult := consume()
+		if consumeResult != nil {
+			fmt.Printf("!! compact err: %v\n", consumeResult)
+		}
+		consumeCh <- consumeResult
+	}()
 
 	// retrieve all known fields
 	fields, err := w.builder.FieldsPostingsList()
@@ -597,6 +781,7 @@ func (w *writer) WriteFSTTerms(iow io.Writer) error {
 		// an error and then the consumer is no longer reading results
 		// and the worker channel becomes blocked.
 		worker.workCh <- writeFSTTermsArgs{
+			argsType:     writeFSTTermsArgsTypeTerms,
 			field:        append(make([]byte, 0, len(f)), f...),
 			metadataBuff: append(make([]byte, 0, len(fieldsMetadata)), fieldsMetadata...),
 			termsOffsets: offsets,
