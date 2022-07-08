@@ -424,7 +424,6 @@ func (cache *SimpleCache) GetValue(
 	st storage.Storage,
 	fetchOptions *storage.FetchOptions,
 	log *zap.Logger) (storage.PromResult, error) {
-
 	queryRange := int64(q.End.Sub(q.Start).Seconds())
 	key := StoreKey{
 		Labels: label_key,
@@ -436,13 +435,25 @@ func (cache *SimpleCache) GetValue(
 	val, ok := cache.get(key)
 	if ok {
 		if minute == val.Minute {
-			log.Info("cache hit", zap.Int64("bytes", int64(val.Result.Metadata.FetchedBytesEstimate)))
+			length := 0
+			if len(val.Result.PromResult.Timeseries) != 0 {
+				for _, ts := range val.Result.PromResult.Timeseries {
+					length += len(ts.Samples)
+				}
+			}
+			log.Info("cache hit", zap.Int64("bytes", int64(val.Result.Metadata.FetchedBytesEstimate)), zap.Int("num_samples", length))
 			return val.Result, nil
 		}
 	}
 
 	result, err := st.FetchProm(ctx, q, fetchOptions)
-	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange), zap.Int64("bytes", int64(result.Metadata.FetchedBytesEstimate)))
+	length := 0
+	if len(result.PromResult.Timeseries) != 0 {
+		for _, ts := range result.PromResult.Timeseries {
+			length += len(ts.Samples)
+		}
+	}
+	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange), zap.Int64("bytes", int64(result.Metadata.FetchedBytesEstimate)), zap.Int("num_samples", length))
 
 	val = StoreVal{
 		Result: result,
