@@ -436,15 +436,13 @@ func (cache *SimpleCache) GetValue(
 	val, ok := cache.get(key)
 	if ok {
 		if minute == val.Minute {
-			log.Info("cache hit")
-			// If we load it in from the cache, then we don't fetch any bytes
-			val.Result.Metadata.FetchedBytesEstimate = 0
+			log.Info("cache hit", zap.Int64("bytes", int64(val.Result.Metadata.FetchedBytesEstimate)))
 			return val.Result, nil
 		}
 	}
 
 	result, err := st.FetchProm(ctx, q, fetchOptions)
-	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange))
+	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange), zap.Int64("bytes", int64(result.Metadata.FetchedBytesEstimate)))
 
 	val = StoreVal{
 		Result: result,
