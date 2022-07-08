@@ -111,7 +111,6 @@ func newReadHandler(
 }
 
 func (h *readHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.logger.Info("handle query - hackathon", zap.String("query", params.Query))
 	ctx := r.Context()
 	ctx, request, err := native.ParseRequest(ctx, r, h.opts.instant, h.hOpts)
 	if err != nil {
