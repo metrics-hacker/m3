@@ -459,6 +459,8 @@ func (cache *SimpleCache) GetValue(
 		Result: result,
 		Minute: minute,
 	}
-	cache.set(key, val)
+	if err == nil {
+		cache.set(key, val)
+	}
 	return result, err
 }
