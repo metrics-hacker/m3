@@ -1557,6 +1557,7 @@ func (s *session) FetchTagged(
 	q index.Query,
 	opts index.QueryOptions,
 ) (encoding.SeriesIterators, FetchResponseMetadata, error) {
+	s.log.Debug("FetchTagged", zap.String("namespace", ns.String()), zap.String("m3 query", q.String()))
 	f := s.pools.fetchTaggedAttempt.Get()
 	f.args.ctx = ctx
 	f.args.ns = ns

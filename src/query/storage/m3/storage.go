@@ -447,7 +447,10 @@ func (s *m3storage) fetchCompressed(
 			session := namespace.Session()
 			namespaceID := namespace.NamespaceID()
 			narrowedQueryOpts := narrowQueryOpts(queryOptions, namespace)
+			s.logger.Debug("m3 store", zap.String("namespace", namespaceID.String()), zap.String("m3query", m3query.String()))
 			iters, metadata, err := session.FetchTagged(ctx, namespaceID, m3query, narrowedQueryOpts)
+			s.logger.Debug("session fetch tagged", zap.String("namespace", namespaceID.String()),
+				zap.Int("series", iters.Len()), zap.Int("m3 rpc count", metadata.Responses))
 			if err == nil && sampled {
 				span.LogFields(
 					log.String("namespace", namespaceID.String()),

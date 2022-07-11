@@ -83,12 +83,12 @@ func (e *StorageErr) Error() string {
 // NewPrometheusQueryable returns a new prometheus queryable backed by a m3
 // storage.
 func NewPrometheusQueryable(opts PrometheusOptions) promstorage.Queryable {
-	scope := opts.InstrumentOptions.MetricsScope().Tagged(map[string]string{"storage": "prometheus_storage"})
+	scope := opts.InstrumentOptions.MetricsScope().SubScope("prometheus-storage")
 	return &prometheusQueryable{
 		storage: opts.Storage,
 		scope:   scope,
 		logger:  opts.InstrumentOptions.Logger(),
-		cache:   NewSimpleCache(),
+		cache:   NewSimpleCache(scope),
 	}
 }
 
@@ -186,7 +186,13 @@ func (q *querier) Select(
 		for _, ts := range result.PromResult.Timeseries {
 			lengths = append(lengths, len(ts.Samples))
 		}
-		fields = append(fields, zap.Int("timeseries_cnt", len(result.PromResult.Timeseries)), zap.Ints("sample_cnts", lengths), zap.Int("est_bytes", result.Metadata.FetchedBytesEstimate))
+		sample_count := 0
+		if len(lengths) > 0 {
+			sample_count = lengths[0] * len(lengths)
+		}
+		fields = append(fields, zap.Int("timeseries_cnt", len(result.PromResult.Timeseries)),
+			zap.Int("sample_cnts", sample_count),
+			zap.Int("est_bytes", result.Metadata.FetchedBytesEstimate))
 	}
 	fields = append(fields, zap.Duration("elapsed", time.Since(start)))
 	q.logger.Info("fetch response", fields...)
@@ -389,18 +395,40 @@ type StoreVal struct {
 
 type SimpleCache struct {
 	Store map[StoreKey]StoreVal
+	getKeyCounter      tally.Counter
+	setKeyCounter      tally.Counter
+	hitCounter         tally.Counter
+	hitSeriesCounter   tally.Counter
+	hitSamplesCounter  tally.Counter
+	hitBytesCounter    tally.Counter
+	missCounter        tally.Counter
+	missSeriesCounter  tally.Counter
+	missSamplesCounter tally.Counter
+	missBytesCounter   tally.Counter
 	mtx   sync.Mutex
 }
 
-func NewSimpleCache() *SimpleCache {
+func NewSimpleCache(scope tally.Scope) *SimpleCache {
+	subScope := scope.SubScope("simple-cache")
 	return &SimpleCache{
 		Store: make(map[StoreKey]StoreVal),
+		getKeyCounter:      subScope.Counter("get-key"),
+		setKeyCounter:      subScope.Counter("set-key"),
+		hitCounter:         subScope.Counter("hit"),
+		hitSeriesCounter:   subScope.Counter("hit-series"),
+		hitSamplesCounter:  subScope.Counter("hit-samples"),
+		hitBytesCounter:    subScope.Counter("hit-bytes"),
+		missCounter:        subScope.Counter("miss"),
+		missSeriesCounter:  subScope.Counter("miss-series"),
+		missSamplesCounter: subScope.Counter("miss-samples"),
+		missBytesCounter:   subScope.Counter("miss-bytes"),
 	}
 }
 
 func (cache *SimpleCache) get(key StoreKey) (StoreVal, bool) {
 	cache.mtx.Lock()
 	if val, ok := cache.Store[key]; ok {
+		cache.getKeyCounter.Inc(1)
 		cache.mtx.Unlock()
 		return val, true
 	}
@@ -412,7 +440,7 @@ func (cache *SimpleCache) set(key StoreKey, val StoreVal) bool {
 	cache.mtx.Lock()
 
 	cache.Store[key] = val
-
+	cache.setKeyCounter.Inc(1)
 	cache.mtx.Unlock()
 	return true
 }
@@ -441,7 +469,14 @@ func (cache *SimpleCache) GetValue(
 					length += len(ts.Samples)
 				}
 			}
-			log.Info("cache hit", zap.Int64("bytes", int64(val.Result.Metadata.FetchedBytesEstimate)), zap.Int("num_samples", length))
+			num_series  := int64(len(val.Result.PromResult.Timeseries))
+			num_samples := int64(length)
+			num_bytes   := int64(val.Result.Metadata.FetchedBytesEstimate)
+			log.Info("cache hit", zap.Int64("series", num_series), zap.Int64("num_samples", num_samples), zap.Int64("bytes", num_bytes))
+			cache.hitCounter.Inc(1)
+			cache.hitSeriesCounter.Inc(num_series)
+			cache.hitSamplesCounter.Inc(num_samples)
+			cache.hitBytesCounter.Inc(num_bytes)
 			return val.Result, nil
 		}
 	}
@@ -453,7 +488,17 @@ func (cache *SimpleCache) GetValue(
 			length += len(ts.Samples)
 		}
 	}
-	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange), zap.Int64("bytes", int64(result.Metadata.FetchedBytesEstimate)), zap.Int("num_samples", length))
+
+
+	num_series  := int64(len(result.PromResult.Timeseries))
+	num_samples := int64(length)
+	num_bytes   := int64(result.Metadata.FetchedBytesEstimate)
+	log.Info("cache miss", zap.Int64("minute", minute), zap.String("label_key", label_key), zap.Int64("range", queryRange),
+		zap.Int64("series", num_series), zap.Int64("num_samples", num_samples), zap.Int64("bytes", num_bytes))
+	cache.missCounter.Inc(1)
+	cache.missSeriesCounter.Inc(num_series)
+	cache.missSamplesCounter.Inc(num_samples)
+	cache.missBytesCounter.Inc(num_bytes)
 
 	val = StoreVal{
 		Result: result,
